@@ -1,5 +1,4 @@
-
-import streamlit as st
+mport streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
@@ -49,8 +48,14 @@ def fit_garch_11(returns):
 
     best = None
     for s in starts:
-        res = minimize(nll, s, method="SLSQP", bounds=bounds, constraints=constraints,
-                       options={"maxiter": 2000, "ftol": 1e-10})
+        res = minimize(
+            nll,
+            s,
+            method="SLSQP",
+            bounds=bounds,
+            constraints=constraints,
+            options={"maxiter": 2000, "ftol": 1e-10},
+        )
         if best is None or res.fun < best.fun:
             best = res
 
@@ -58,6 +63,7 @@ def fit_garch_11(returns):
     eps = r - mu
     h = np.empty(len(r))
     h[0] = max(var0, 1e-8)
+
     for t in range(1, len(r)):
         h[t] = omega + alpha * eps[t - 1] ** 2 + beta * h[t - 1]
 
@@ -93,10 +99,12 @@ def drawdown_from_pl(daily_pl):
 def parse_strategy_file(upload, fallback_strategy_name):
     if upload is None:
         return None
+
     if upload.name.lower().endswith(".xlsx"):
         df = pd.read_excel(upload)
     else:
         df = pd.read_csv(upload)
+
     df = clean_columns(df)
 
     date_col = next((c for c in df.columns if c.lower() in ["date", "trade_date", "close_date"]), None)
@@ -112,28 +120,39 @@ def parse_strategy_file(upload, fallback_strategy_name):
     out["Strategy"] = df[strategy_col] if strategy_col else fallback_strategy_name
     out["Daily_PL"] = pd.to_numeric(df[pl_col], errors="coerce")
     out["Capital_Used"] = pd.to_numeric(df[cap_col], errors="coerce") if cap_col else np.nan
+
     return out.dropna(subset=["Date", "Daily_PL"])
 
 def vix_regime_multiplier(vix):
-    if pd.isna(vix): return 1.0
-    if vix < 15: return 1.10
-    if vix < 20: return 1.00
-    if vix < 25: return 0.80
+    if pd.isna(vix):
+        return 1.0
+    if vix < 15:
+        return 1.10
+    if vix < 20:
+        return 1.00
+    if vix < 25:
+        return 0.80
     return 0.60
 
 def realized_vol_multiplier(rv):
-    if pd.isna(rv): return 1.0
-    if rv < 12: return 1.10
-    if rv < 18: return 1.00
-    if rv < 25: return 0.75
+    if pd.isna(rv):
+        return 1.0
+    if rv < 12:
+        return 1.10
+    if rv < 18:
+        return 1.00
+    if rv < 25:
+        return 0.75
     return 0.55
 
 def build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, current_vix=None, current_spx_rv=None):
-    rows, charts = [], {}
+    rows = []
+    charts = {}
     n_strats = strategy_df["Strategy"].nunique()
 
     for strategy, g in strategy_df.groupby("Strategy"):
         g = g.sort_values("Date").copy()
+
         if g["Capital_Used"].notna().sum() == 0:
             g["Capital_Used"] = max_capital / max(n_strats, 1)
         else:
@@ -143,14 +162,24 @@ def build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, curr
         g = g.replace([np.inf, -np.inf], np.nan).dropna(subset=["Return"])
 
         if len(g) < 30:
-            rows.append({"Strategy": strategy, "Signal": "Insufficient data", "Recommended Capital": 0,
-                         "Deployment %": 0, "Reason": "Need at least 30 observations."})
+            rows.append({
+                "Strategy": strategy,
+                "Signal": "Insufficient data",
+                "Recommended Capital": 0,
+                "Deployment %": 0,
+                "Reason": "Need at least 30 observations.",
+            })
             continue
 
         model = fit_garch_11(g["Return"])
         if model is None:
-            rows.append({"Strategy": strategy, "Signal": "Insufficient data", "Recommended Capital": 0,
-                         "Deployment %": 0, "Reason": "Could not estimate GARCH model."})
+            rows.append({
+                "Strategy": strategy,
+                "Signal": "Insufficient data",
+                "Recommended Capital": 0,
+                "Deployment %": 0,
+                "Reason": "Could not estimate GARCH model.",
+            })
             continue
 
         g["Drawdown"] = drawdown_from_pl(g["Daily_PL"])
@@ -161,9 +190,24 @@ def build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, curr
         avg_daily_return = float(g["Return"].mean())
 
         vol_mult = float(np.clip(target_vol / max(model["current_ann_vol_pct"], 1e-6), min_mult, max_mult))
-        dd_mult = 1.00 if current_dd > -0.05 else 0.85 if current_dd > -0.10 else 0.65 if current_dd > -0.15 else 0.50 if current_dd > -0.20 else 0.35
-        tail_mult = 1 / ((1 + max(kurt, 0) / 5) * (1 + abs(min(p5, 0)) * 10))
+
+        if current_dd > -0.05:
+            dd_mult = 1.00
+        elif current_dd > -0.10:
+            dd_mult = 0.85
+        elif current_dd > -0.15:
+            dd_mult = 0.65
+        elif current_dd > -0.20:
+            dd_mult = 0.50
+        else:
+            dd_mult = 0.35
+
+        tail_penalty = 1 + max(kurt, 0) / 5
+        downside_penalty = 1 + abs(min(p5, 0)) * 10
+        tail_mult = 1 / (tail_penalty * downside_penalty)
+
         regime_mult = vix_regime_multiplier(current_vix) * realized_vol_multiplier(current_spx_rv)
+
         edge_score = max(avg_daily_return, 0.00001) * max(win_rate, 0.01)
         raw_score = edge_score * vol_mult * dd_mult * tail_mult * regime_mult
 
@@ -175,19 +219,35 @@ def build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, curr
             signal = "Hold"
 
         rows.append({
-            "Strategy": strategy, "Signal": signal, "Avg Daily Return %": avg_daily_return * 100,
-            "Win Rate %": win_rate * 100, "GARCH Vol %": model["current_ann_vol_pct"],
-            "Long-Run Vol %": model["long_run_ann_vol_pct"], "Alpha": model["alpha"],
-            "Beta": model["beta"], "Alpha + Beta": model["alpha_beta"],
-            "Vol Half-Life Days": model["half_life_days"], "Current Drawdown %": current_dd * 100,
-            "Excess Kurtosis": kurt, "5th Percentile Return %": p5 * 100,
-            "Vol Multiplier": vol_mult, "Drawdown Multiplier": dd_mult,
-            "Tail Multiplier": tail_mult, "Regime Multiplier": regime_mult,
-            "Raw Score": raw_score, "Reason": "Volatility, drawdown, tail-risk, and regime-adjusted allocation score."
+            "Strategy": strategy,
+            "Signal": signal,
+            "Avg Daily Return %": avg_daily_return * 100,
+            "Win Rate %": win_rate * 100,
+            "GARCH Vol %": model["current_ann_vol_pct"],
+            "Long-Run Vol %": model["long_run_ann_vol_pct"],
+            "Alpha": model["alpha"],
+            "Beta": model["beta"],
+            "Alpha + Beta": model["alpha_beta"],
+            "Vol Half-Life Days": model["half_life_days"],
+            "Current Drawdown %": current_dd * 100,
+            "Excess Kurtosis": kurt,
+            "5th Percentile Return %": p5 * 100,
+            "Vol Multiplier": vol_mult,
+            "Drawdown Multiplier": dd_mult,
+            "Tail Multiplier": tail_mult,
+            "Regime Multiplier": regime_mult,
+            "Raw Score": raw_score,
+            "Reason": "Volatility, drawdown, tail-risk, and regime-adjusted allocation score.",
         })
-        charts[strategy] = {"dates": g["Date"], "vol": model["cond_vol_series_pct"], "forecast": model["forecast_vol_pct"]}
+
+        charts[strategy] = {
+            "dates": g["Date"],
+            "vol": model["cond_vol_series_pct"],
+            "forecast": model["forecast_vol_pct"],
+        }
 
     signals = pd.DataFrame(rows)
+
     if "Raw Score" in signals.columns and signals["Raw Score"].fillna(0).sum() > 0:
         signals["Weight"] = signals["Raw Score"].fillna(0) / signals["Raw Score"].fillna(0).sum()
         signals["Recommended Capital"] = signals["Weight"] * max_capital
@@ -196,6 +256,7 @@ def build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, curr
         signals["Weight"] = 0
         signals["Recommended Capital"] = 0
         signals["Deployment %"] = 0
+
     return signals.sort_values("Recommended Capital", ascending=False), charts
 
 st.sidebar.header("Portfolio Controls")
@@ -218,13 +279,27 @@ Required columns: `Date`, `Daily_PL` or `P/L`
 Recommended columns: `Capital_Used` or `Margin`
 """)
 
-c1, c2, c3 = st.columns(3)
-with c1: range_file = st.file_uploader("Range", type=["csv", "xlsx"])
-with c2: weak_file = st.file_uploader("Weak", type=["csv", "xlsx"])
-with c3: power_file = st.file_uploader("Power Hour", type=["csv", "xlsx"])
+c1, c2 = st.columns(2)
+c3, c4 = st.columns(2)
+
+with c1:
+    range_file = st.file_uploader("Range", type=["csv", "xlsx"])
+with c2:
+    greenday_file = st.file_uploader("Greenday", type=["csv", "xlsx"])
+with c3:
+    weak_file = st.file_uploader("Weak", type=["csv", "xlsx"])
+with c4:
+    power_file = st.file_uploader("Power Hour", type=["csv", "xlsx"])
+
+uploads = [
+    ("Range", range_file),
+    ("Greenday", greenday_file),
+    ("Weak", weak_file),
+    ("Power Hour", power_file),
+]
 
 frames = []
-for name, f in [("Range", range_file), ("Weak", weak_file), ("Power Hour", power_file)]:
+for name, f in uploads:
     if f is not None:
         try:
             frames.append(parse_strategy_file(f, name))
@@ -236,26 +311,34 @@ if not frames:
     st.stop()
 
 strategy_df = pd.concat(frames, ignore_index=True)
+
 st.subheader("Uploaded Data Preview")
 st.dataframe(strategy_df.tail(25), use_container_width=True)
 
 st.header("2. Today’s Capital Deployment Signal")
 signals, charts = build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, current_vix, current_spx_rv)
+
 st.caption(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-display_cols = ["Strategy", "Signal", "Recommended Capital", "Deployment %", "GARCH Vol %",
-                "Current Drawdown %", "Excess Kurtosis", "Win Rate %", "Avg Daily Return %", "Alpha + Beta"]
+display_cols = [
+    "Strategy", "Signal", "Recommended Capital", "Deployment %",
+    "GARCH Vol %", "Current Drawdown %", "Excess Kurtosis",
+    "Win Rate %", "Avg Daily Return %", "Alpha + Beta"
+]
 display_cols = [c for c in display_cols if c in signals.columns]
+
 st.dataframe(signals[display_cols], use_container_width=True)
 
 total_deployed = float(signals["Recommended Capital"].sum())
 cash_reserve = max_capital - total_deployed
+
 m1, m2, m3 = st.columns(3)
 m1.metric("Recommended Deployment", f"${total_deployed:,.0f}")
 m2.metric("Cash Reserve", f"${cash_reserve:,.0f}")
 m3.metric("Max Capital", f"${max_capital:,.0f}")
 
 st.header("3. Charts")
+
 fig, ax = plt.subplots(figsize=(10, 5))
 ax.bar(signals["Strategy"], signals["Recommended Capital"])
 ax.set_title("Recommended Capital by Strategy")
@@ -282,5 +365,11 @@ st.pyplot(fig3)
 
 st.header("4. Export Signal")
 csv = signals.to_csv(index=False).encode("utf-8")
-st.download_button("Download Today’s Signal CSV", csv, file_name=f"garch_signal_{datetime.now().date()}.csv", mime="text/csv")
+st.download_button(
+    "Download Today’s Signal CSV",
+    csv,
+    file_name=f"garch_signal_{datetime.now().date()}.csv",
+    mime="text/csv",
+)
+
 st.warning("Research and decision-support only. This app does not place trades and should be validated before scaling capital.")
