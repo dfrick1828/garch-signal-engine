@@ -1,1 +1,1 @@
-Fixed v5 app with OpenDate and TotalNetProfitLoss support.
+Full v5 app with analysis restored and OpenDate/TotalNetProfitLoss support.
