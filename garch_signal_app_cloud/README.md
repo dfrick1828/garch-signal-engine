@@ -1,42 +1,42 @@
-# GARCH Regime Signal Engine v3
+# GARCH Probabilistic Regime Engine v4
 
-This version upgrades the app from historical risk-adjusted allocation to regime-aware allocation.
+This version replaces manual regime selection with probabilistic regime forecasting.
 
 ## What changed
 
-Old:
-- Allocates mostly toward historically stronger strategies.
+Old v3:
+- User manually selected one expected regime.
 
-New:
-- Classifies historical market regimes using SPX/VIX open-close behavior.
-- Measures each strategy's return by regime.
-- Lets the user select today's expected regime.
-- Allocates based on expected edge in that regime, adjusted by GARCH volatility, drawdown, and tail risk.
+New v4:
+- User enters current market inputs:
+  - Current VIX
+  - VIX change
+  - SPX pre-market / overnight gap
+  - Recent SPX realized volatility
+- App estimates probabilities for:
+  - Normal
+  - Compression
+  - Trend Up
+  - Trend Down
+  - Vol Expansion
+- Strategy allocation is based on probability-weighted expected return by regime.
 
-## Supported strategy files
+## Allocation concept
 
-- Range
-- Greenday
-- Weak
-- Power Hour
+Allocation is now based on:
 
-The app accepts the actual strategy export format with columns such as:
-
-- Date
-- Strategy
-- Daily_PL
-- BuyingPower
-- UnderlyingOpenQuote
-- UnderlyingCloseQuote
-- VIXOpenQuote
-- VIXCloseQuote
+Probability-weighted expected regime edge
+adjusted by:
+- GARCH volatility
+- drawdown
+- tail risk
 
 ## Deploy
 
-Replace the existing GitHub files with:
+Replace existing GitHub files with:
 
 - app.py
 - requirements.txt
 - README.md
 
-Then redeploy Streamlit.
+Then reboot or redeploy the Streamlit app.

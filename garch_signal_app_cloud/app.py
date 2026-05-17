@@ -6,9 +6,9 @@ from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 from datetime import datetime
 
-st.set_page_config(page_title="GARCH Regime Signal Engine", page_icon="📈", layout="wide")
-st.title("GARCH Regime Signal Engine")
-st.caption("Regime-aware daily capital deployment for intraday SPX premium-harvesting strategies.")
+st.set_page_config(page_title="GARCH Probabilistic Regime Engine", page_icon="📈", layout="wide")
+st.title("GARCH Probabilistic Regime Engine")
+st.caption("Probability-weighted regime forecasting for intraday SPX premium-harvesting deployment.")
 
 # -----------------------------
 # Helpers
@@ -64,6 +64,7 @@ def fit_garch_11(returns):
     eps = r - mu
     h = np.empty(len(r))
     h[0] = max(var0, 1e-8)
+
     for t in range(1, len(r)):
         h[t] = omega + alpha * eps[t - 1] ** 2 + beta * h[t - 1]
 
@@ -125,30 +126,21 @@ def parse_trade_file(upload, fallback_strategy_name):
 
     df = clean_columns(df)
 
-    # Required-ish fields for actual uploaded files
     if "Date" not in df.columns:
         raise ValueError(f"{fallback_strategy_name}: file must include Date column.")
 
     if "Daily_PL" not in df.columns:
-        # Allow alternate naming
         alt = next((c for c in df.columns if c.lower() in ["daily p/l", "p/l", "pl", "net_pl", "net p/l"]), None)
         if alt:
             df["Daily_PL"] = df[alt]
         else:
             raise ValueError(f"{fallback_strategy_name}: file must include Daily_PL or P/L.")
 
-    if "Strategy" not in df.columns:
-        df["Strategy"] = fallback_strategy_name
-    else:
-        # Use upload slot name to force sleeve-level grouping
-        df["Strategy"] = fallback_strategy_name
+    df["Strategy"] = fallback_strategy_name
 
     if "BuyingPower" not in df.columns:
         alt = next((c for c in df.columns if c.lower() in ["capital_used", "capital used", "margin", "margin req.", "buying_power"]), None)
-        if alt:
-            df["BuyingPower"] = df[alt]
-        else:
-            df["BuyingPower"] = np.nan
+        df["BuyingPower"] = df[alt] if alt else np.nan
 
     keep_cols = [
         "Date", "Strategy", "Daily_PL", "BuyingPower",
@@ -165,6 +157,7 @@ def parse_trade_file(upload, fallback_strategy_name):
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
     out["Daily_PL"] = pd.to_numeric(out["Daily_PL"], errors="coerce")
     out["BuyingPower"] = pd.to_numeric(out["BuyingPower"], errors="coerce")
+
     for c in ["UnderlyingOpenQuote", "UnderlyingCloseQuote", "VIXOpenQuote", "VIXCloseQuote"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
@@ -199,11 +192,75 @@ def build_regime_performance(daily):
     ).reset_index()
     return perf
 
-def build_signals(daily, expected_regime, max_capital, target_vol, min_mult, max_mult):
+def infer_regime_probabilities(daily, current_vix, current_vix_change, current_spx_gap, recent_realized_vol):
+    """
+    Heuristic first-pass regime probability model.
+    This replaces the manual regime selector.
+    It uses current market inputs to produce a probability distribution across regimes.
+    """
+    regimes = ["Normal", "Compression", "Trend Up", "Trend Down", "Vol Expansion"]
+
+    # Start with historical base rates
+    hist = daily.drop_duplicates("Date")["Regime"].value_counts(normalize=True)
+    probs = {r: float(hist.get(r, 0.05)) for r in regimes}
+
+    # Ensure no zero probabilities
+    for r in regimes:
+        probs[r] = max(probs[r], 0.05)
+
+    # Vol expansion drivers
+    if current_vix >= 25:
+        probs["Vol Expansion"] += 0.35
+    elif current_vix >= 20:
+        probs["Vol Expansion"] += 0.18
+    elif current_vix <= 15:
+        probs["Compression"] += 0.12
+        probs["Normal"] += 0.08
+
+    if current_vix_change >= 1.0:
+        probs["Vol Expansion"] += 0.30
+    elif current_vix_change >= 0.5:
+        probs["Vol Expansion"] += 0.15
+    elif current_vix_change <= -0.75:
+        probs["Compression"] += 0.25
+    elif current_vix_change <= -0.25:
+        probs["Compression"] += 0.10
+
+    # Gap / overnight directional risk
+    if current_spx_gap >= 0.006:
+        probs["Trend Up"] += 0.22
+        probs["Vol Expansion"] += 0.08
+    elif current_spx_gap <= -0.006:
+        probs["Trend Down"] += 0.22
+        probs["Vol Expansion"] += 0.10
+    elif abs(current_spx_gap) <= 0.002:
+        probs["Normal"] += 0.10
+        probs["Compression"] += 0.08
+
+    # Realized volatility state
+    if recent_realized_vol >= 20:
+        probs["Vol Expansion"] += 0.25
+    elif recent_realized_vol >= 15:
+        probs["Vol Expansion"] += 0.10
+        probs["Normal"] += 0.05
+    elif recent_realized_vol <= 10:
+        probs["Compression"] += 0.15
+        probs["Normal"] += 0.10
+
+    total = sum(probs.values())
+    probs = {k: v / total for k, v in probs.items()}
+
+    return pd.DataFrame({
+        "Regime": list(probs.keys()),
+        "Probability": list(probs.values())
+    }).sort_values("Probability", ascending=False)
+
+def build_probabilistic_signals(daily, regime_probs, max_capital, target_vol, min_mult, max_mult):
     rows = []
     charts = {}
-
     perf = build_regime_performance(daily)
+
+    prob_map = dict(zip(regime_probs["Regime"], regime_probs["Probability"]))
 
     for strategy, g in daily.groupby("Strategy"):
         g = g.sort_values("Date").copy()
@@ -224,20 +281,27 @@ def build_signals(daily, expected_regime, max_capital, target_vol, min_mult, max
         current_dd = float(g["Drawdown"].iloc[-1])
         kurt = float(g["Return"].kurt())
         p5 = float(g["Return"].quantile(0.05))
-        win_rate = float((g["Daily_PL"] > 0).mean())
         avg_return_all = float(g["Return"].mean())
+        win_rate_all = float((g["Daily_PL"] > 0).mean())
 
-        regime_row = perf[(perf["Strategy"] == strategy) & (perf["Regime"] == expected_regime)]
-        if len(regime_row) > 0 and regime_row["Days"].iloc[0] >= 3:
-            expected_return = float(regime_row["Avg_Return"].iloc[0])
-            regime_days = int(regime_row["Days"].iloc[0])
-            regime_win = float(regime_row["Win_Rate"].iloc[0])
-            regime_source = "Regime-specific"
-        else:
-            expected_return = avg_return_all
-            regime_days = 0
-            regime_win = win_rate
-            regime_source = "Fallback: all history"
+        expected_return = 0.0
+        expected_win = 0.0
+        weighted_days = 0.0
+
+        for regime, prob in prob_map.items():
+            rr = perf[(perf["Strategy"] == strategy) & (perf["Regime"] == regime)]
+            if len(rr) > 0 and rr["Days"].iloc[0] >= 3:
+                r_ret = float(rr["Avg_Return"].iloc[0])
+                r_win = float(rr["Win_Rate"].iloc[0])
+                r_days = int(rr["Days"].iloc[0])
+            else:
+                r_ret = avg_return_all
+                r_win = win_rate_all
+                r_days = 0
+
+            expected_return += prob * r_ret
+            expected_win += prob * r_win
+            weighted_days += prob * r_days
 
         vol_mult = float(np.clip(target_vol / max(model["current_ann_vol_pct"], 1e-6), min_mult, max_mult))
 
@@ -256,7 +320,7 @@ def build_signals(daily, expected_regime, max_capital, target_vol, min_mult, max
         downside_penalty = 1 + abs(min(p5, 0)) * 10
         tail_mult = 1 / (tail_penalty * downside_penalty)
 
-        edge_score = max(expected_return, 0.00001) * max(regime_win, 0.01)
+        edge_score = max(expected_return, 0.00001) * max(expected_win, 0.01)
         raw_score = edge_score * vol_mult * dd_mult * tail_mult
 
         if expected_return <= 0:
@@ -271,12 +335,10 @@ def build_signals(daily, expected_regime, max_capital, target_vol, min_mult, max
         rows.append({
             "Strategy": strategy,
             "Signal": signal,
-            "Expected Regime": expected_regime,
-            "Regime Source": regime_source,
-            "Regime Days": regime_days,
-            "Expected Regime Return %": expected_return * 100,
+            "Probability-Weighted Expected Return %": expected_return * 100,
             "All-History Avg Return %": avg_return_all * 100,
-            "Regime Win Rate %": regime_win * 100,
+            "Probability-Weighted Win Rate %": expected_win * 100,
+            "Weighted Regime Sample Days": weighted_days,
             "GARCH Vol %": model["current_ann_vol_pct"],
             "Long-Run Vol %": model["long_run_ann_vol_pct"],
             "Alpha + Beta": model["alpha_beta"],
@@ -317,20 +379,20 @@ target_vol = st.sidebar.number_input("Target Annualized Strategy Volatility (%)"
 min_mult = st.sidebar.slider("Minimum Strategy Multiplier", 0.0, 1.0, 0.40, 0.05)
 max_mult = st.sidebar.slider("Maximum Strategy Multiplier", 0.5, 2.0, 1.25, 0.05)
 
-st.sidebar.header("Expected Regime")
-expected_regime = st.sidebar.selectbox(
-    "Select expected market regime for today's deployment",
-    ["Normal", "Compression", "Trend Up", "Trend Down", "Vol Expansion"]
-)
+st.sidebar.header("Current Market Inputs")
+current_vix = st.sidebar.number_input("Current VIX", min_value=0.0, value=18.0, step=0.5)
+current_vix_change = st.sidebar.number_input("Current VIX Change", value=0.0, step=0.25)
+current_spx_gap = st.sidebar.number_input("Overnight / Pre-Market SPX Gap (%)", value=0.0, step=0.1) / 100.0
+recent_realized_vol = st.sidebar.number_input("Recent SPX Realized Vol (%)", min_value=0.0, value=12.0, step=0.5)
 
-st.sidebar.caption("Version 3: Regime-aware allocation engine")
+st.sidebar.caption("Version 4: Probabilistic regime forecasting")
 
 # -----------------------------
 # Uploads
 # -----------------------------
-st.header("1. Upload Daily Strategy Export Files")
+st.header("1. Upload Strategy Export Files")
 st.markdown("""
-Upload the actual strategy export files. The app will aggregate them by date and classify each day by regime using SPX and VIX open/close behavior.
+Upload actual strategy export files. The app aggregates them by date and strategy, classifies historical regimes, estimates regime probabilities, and produces probability-weighted deployment signals.
 """)
 
 c1, c2 = st.columns(2)
@@ -361,7 +423,7 @@ for name, f in uploads:
             st.error(str(e))
 
 if not frames:
-    st.info("Upload strategy export files to generate regime-aware signals.")
+    st.info("Upload strategy export files to generate signals.")
     st.stop()
 
 trades = pd.concat(frames, ignore_index=True)
@@ -371,9 +433,36 @@ st.subheader("Daily Aggregated Data Preview")
 st.dataframe(daily.tail(25), use_container_width=True)
 
 # -----------------------------
+# Regime probabilities
+# -----------------------------
+st.header("2. Probabilistic Regime Forecast")
+
+regime_probs = infer_regime_probabilities(
+    daily,
+    current_vix=current_vix,
+    current_vix_change=current_vix_change,
+    current_spx_gap=current_spx_gap,
+    recent_realized_vol=recent_realized_vol
+)
+
+col_a, col_b = st.columns([1, 1])
+
+with col_a:
+    st.dataframe(regime_probs.assign(Probability=lambda x: x["Probability"] * 100), use_container_width=True)
+
+with col_b:
+    figp, axp = plt.subplots(figsize=(6, 4))
+    axp.bar(regime_probs["Regime"], regime_probs["Probability"] * 100)
+    axp.set_title("Forecast Regime Probabilities")
+    axp.set_ylabel("Probability (%)")
+    axp.tick_params(axis="x", rotation=30)
+    st.pyplot(figp)
+
+# -----------------------------
 # Regime matrix
 # -----------------------------
-st.header("2. Regime Performance Matrix")
+st.header("3. Strategy Performance by Regime")
+
 perf = build_regime_performance(daily)
 
 pivot = perf.pivot_table(
@@ -389,15 +478,23 @@ st.dataframe(pivot.round(3), use_container_width=True)
 # -----------------------------
 # Signals
 # -----------------------------
-st.header("3. Today’s Regime-Aware Deployment Signal")
-signals, charts, perf = build_signals(daily, expected_regime, max_capital, target_vol, min_mult, max_mult)
+st.header("4. Probability-Weighted Deployment Signal")
+
+signals, charts, perf = build_probabilistic_signals(
+    daily,
+    regime_probs,
+    max_capital,
+    target_vol,
+    min_mult,
+    max_mult
+)
 
 st.caption(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 display_cols = [
     "Strategy", "Signal", "Recommended Capital", "Deployment %",
-    "Expected Regime", "Expected Regime Return %",
-    "Regime Days", "Regime Win Rate %",
+    "Probability-Weighted Expected Return %",
+    "Probability-Weighted Win Rate %",
     "GARCH Vol %", "Current Drawdown %",
     "Excess Kurtosis", "Alpha + Beta"
 ]
@@ -416,11 +513,11 @@ m3.metric("Max Capital", f"${max_capital:,.0f}")
 # -----------------------------
 # Charts
 # -----------------------------
-st.header("4. Charts")
+st.header("5. Charts")
 
 fig, ax = plt.subplots(figsize=(10, 5))
 ax.bar(signals["Strategy"], signals["Recommended Capital"])
-ax.set_title(f"Recommended Capital by Strategy — Expected Regime: {expected_regime}")
+ax.set_title("Recommended Capital by Strategy — Probability-Weighted")
 ax.set_ylabel("Capital ($)")
 st.pyplot(fig)
 
@@ -445,11 +542,18 @@ st.pyplot(fig3)
 # -----------------------------
 # Downloads
 # -----------------------------
-st.header("5. Export")
+st.header("6. Export")
 st.download_button(
     "Download Today’s Signal CSV",
     signals.to_csv(index=False).encode("utf-8"),
-    file_name=f"regime_garch_signal_{datetime.now().date()}.csv",
+    file_name=f"probabilistic_regime_garch_signal_{datetime.now().date()}.csv",
+    mime="text/csv"
+)
+
+st.download_button(
+    "Download Regime Probability CSV",
+    regime_probs.to_csv(index=False).encode("utf-8"),
+    file_name="regime_probabilities.csv",
     mime="text/csv"
 )
 
