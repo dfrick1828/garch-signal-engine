@@ -1,42 +1,19 @@
-# GARCH Probabilistic Regime Engine v4
+# GARCH Signal Engine v5 — Exploration Capital
 
-This version replaces manual regime selection with probabilistic regime forecasting.
+This version adds exploration capital to the probabilistic regime engine.
 
 ## What changed
 
-Old v3:
-- User manually selected one expected regime.
+- Splits recommended capital into:
+  - Exploitation Capital
+  - Exploration Capital
+- Maintains small observation allocations for strategies that are not currently favored.
+- Allows extreme-risk overrides where exploration capital is set to zero.
 
-New v4:
-- User enters current market inputs:
-  - Current VIX
-  - VIX change
-  - SPX pre-market / overnight gap
-  - Recent SPX realized volatility
-- App estimates probabilities for:
-  - Normal
-  - Compression
-  - Trend Up
-  - Trend Down
-  - Vol Expansion
-- Strategy allocation is based on probability-weighted expected return by regime.
-
-## Allocation concept
-
-Allocation is now based on:
-
-Probability-weighted expected regime edge
-adjusted by:
-- GARCH volatility
-- drawdown
-- tail risk
-
-## Deploy
-
-Replace existing GitHub files with:
+## Replace these files in GitHub
 
 - app.py
 - requirements.txt
 - README.md
 
-Then reboot or redeploy the Streamlit app.
+Then reboot/redeploy Streamlit.
