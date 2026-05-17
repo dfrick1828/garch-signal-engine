@@ -1,26 +1,42 @@
-# GARCH Signal Engine — Cloud Version
+# GARCH Regime Signal Engine v3
 
-Deploy on Streamlit Cloud:
+This version upgrades the app from historical risk-adjusted allocation to regime-aware allocation.
 
-1. Create a GitHub repository named `garch-signal-engine`.
-2. Upload:
-   - `app.py`
-   - `requirements.txt`
-   - `sample_strategy_daily.csv`
-3. Go to Streamlit Cloud.
-4. Click New app.
-5. Select the GitHub repo.
-6. Set main file path to `app.py`.
-7. Deploy.
+## What changed
 
-Daily workflow:
-- Open the Streamlit app link.
-- Enter VIX, SPX 20-day realized volatility, and max capital.
-- Upload Range, Weak, and Power Hour daily CSVs.
-- Review the recommended deployment signal.
+Old:
+- Allocates mostly toward historically stronger strategies.
 
-CSV format:
+New:
+- Classifies historical market regimes using SPX/VIX open-close behavior.
+- Measures each strategy's return by regime.
+- Lets the user select today's expected regime.
+- Allocates based on expected edge in that regime, adjusted by GARCH volatility, drawdown, and tail risk.
 
-Date,Daily_PL,Capital_Used
-2026-05-01,425,30000
-2026-05-02,-310,30000
+## Supported strategy files
+
+- Range
+- Greenday
+- Weak
+- Power Hour
+
+The app accepts the actual strategy export format with columns such as:
+
+- Date
+- Strategy
+- Daily_PL
+- BuyingPower
+- UnderlyingOpenQuote
+- UnderlyingCloseQuote
+- VIXOpenQuote
+- VIXCloseQuote
+
+## Deploy
+
+Replace the existing GitHub files with:
+
+- app.py
+- requirements.txt
+- README.md
+
+Then redeploy Streamlit.

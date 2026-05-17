@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5,10 +6,13 @@ from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 from datetime import datetime
 
-st.set_page_config(page_title="GARCH Signal Engine", page_icon="📈", layout="wide")
-st.title("GARCH Signal Engine")
-st.caption("Cloud dashboard for daily capital deployment signals.")
+st.set_page_config(page_title="GARCH Regime Signal Engine", page_icon="📈", layout="wide")
+st.title("GARCH Regime Signal Engine")
+st.caption("Regime-aware daily capital deployment for intraday SPX premium-harvesting strategies.")
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def clean_columns(df):
     df = df.copy()
     df.columns = [str(c).replace("\xa0", "").strip() for c in df.columns]
@@ -17,6 +21,7 @@ def clean_columns(df):
 def fit_garch_11(returns):
     r = pd.Series(returns).dropna().astype(float).values * 100.0
     r = r[np.isfinite(r)]
+
     if len(r) < 30 or np.std(r) == 0:
         return None
 
@@ -49,11 +54,7 @@ def fit_garch_11(returns):
     best = None
     for s in starts:
         res = minimize(
-            nll,
-            s,
-            method="SLSQP",
-            bounds=bounds,
-            constraints=constraints,
+            nll, s, method="SLSQP", bounds=bounds, constraints=constraints,
             options={"maxiter": 2000, "ftol": 1e-10},
         )
         if best is None or res.fun < best.fun:
@@ -63,7 +64,6 @@ def fit_garch_11(returns):
     eps = r - mu
     h = np.empty(len(r))
     h[0] = max(var0, 1e-8)
-
     for t in range(1, len(r)):
         h[t] = omega + alpha * eps[t - 1] ** 2 + beta * h[t - 1]
 
@@ -71,7 +71,6 @@ def fit_garch_11(returns):
     current_vol = np.sqrt(h[-1]) * np.sqrt(252)
     long_run_var = omega / (1 - persistence) if persistence < 1 else np.nan
     long_run_vol = np.sqrt(long_run_var) * np.sqrt(252) if np.isfinite(long_run_var) else np.nan
-    half_life = np.log(0.5) / np.log(persistence) if 0 < persistence < 1 else np.nan
 
     forecast = []
     next_var = h[-1]
@@ -86,7 +85,6 @@ def fit_garch_11(returns):
         "alpha_beta": persistence,
         "current_ann_vol_pct": current_vol,
         "long_run_ann_vol_pct": long_run_vol,
-        "half_life_days": half_life,
         "cond_vol_series_pct": np.sqrt(h) * np.sqrt(252),
         "forecast_vol_pct": np.array(forecast),
     }
@@ -96,7 +94,27 @@ def drawdown_from_pl(daily_pl):
     shifted = equity - equity.min() + 1
     return shifted / shifted.cummax() - 1
 
-def parse_strategy_file(upload, fallback_strategy_name):
+def classify_regime(row):
+    vix_open = row.get("VIXOpenQuote", np.nan)
+    vix_close = row.get("VIXCloseQuote", np.nan)
+    spx_open = row.get("UnderlyingOpenQuote", np.nan)
+    spx_close = row.get("UnderlyingCloseQuote", np.nan)
+
+    vix_change = vix_close - vix_open if pd.notna(vix_open) and pd.notna(vix_close) else 0
+    spx_move = (spx_close / spx_open - 1) if pd.notna(spx_open) and pd.notna(spx_close) and spx_open != 0 else 0
+    abs_move = abs(spx_move)
+
+    if vix_open >= 25 or vix_change >= 1.0 or abs_move >= 0.012:
+        return "Vol Expansion"
+    if spx_move >= 0.006:
+        return "Trend Up"
+    if spx_move <= -0.006:
+        return "Trend Down"
+    if vix_change <= -0.5 and abs_move <= 0.006:
+        return "Compression"
+    return "Normal"
+
+def parse_trade_file(upload, fallback_strategy_name):
     if upload is None:
         return None
 
@@ -107,79 +125,99 @@ def parse_strategy_file(upload, fallback_strategy_name):
 
     df = clean_columns(df)
 
-    date_col = next((c for c in df.columns if c.lower() in ["date", "trade_date", "close_date"]), None)
-    pl_col = next((c for c in df.columns if c.lower() in ["daily_pl", "daily p/l", "p/l", "pl", "net_pl", "net p/l", "profit_loss"]), None)
-    cap_col = next((c for c in df.columns if c.lower() in ["capital_used", "capital used", "capital", "margin", "margin_req", "margin req.", "buying_power"]), None)
-    strategy_col = next((c for c in df.columns if c.lower() == "strategy"), None)
+    # Required-ish fields for actual uploaded files
+    if "Date" not in df.columns:
+        raise ValueError(f"{fallback_strategy_name}: file must include Date column.")
 
-    if date_col is None or pl_col is None:
-        raise ValueError(f"{fallback_strategy_name}: file must include Date and Daily_PL or P/L.")
+    if "Daily_PL" not in df.columns:
+        # Allow alternate naming
+        alt = next((c for c in df.columns if c.lower() in ["daily p/l", "p/l", "pl", "net_pl", "net p/l"]), None)
+        if alt:
+            df["Daily_PL"] = df[alt]
+        else:
+            raise ValueError(f"{fallback_strategy_name}: file must include Daily_PL or P/L.")
 
-    out = pd.DataFrame()
-    out["Date"] = pd.to_datetime(df[date_col])
-    out["Strategy"] = df[strategy_col] if strategy_col else fallback_strategy_name
-    out["Daily_PL"] = pd.to_numeric(df[pl_col], errors="coerce")
-    out["Capital_Used"] = pd.to_numeric(df[cap_col], errors="coerce") if cap_col else np.nan
+    if "Strategy" not in df.columns:
+        df["Strategy"] = fallback_strategy_name
+    else:
+        # Use upload slot name to force sleeve-level grouping
+        df["Strategy"] = fallback_strategy_name
+
+    if "BuyingPower" not in df.columns:
+        alt = next((c for c in df.columns if c.lower() in ["capital_used", "capital used", "margin", "margin req.", "buying_power"]), None)
+        if alt:
+            df["BuyingPower"] = df[alt]
+        else:
+            df["BuyingPower"] = np.nan
+
+    keep_cols = [
+        "Date", "Strategy", "Daily_PL", "BuyingPower",
+        "UnderlyingOpenQuote", "UnderlyingCloseQuote",
+        "VIXOpenQuote", "VIXCloseQuote",
+        "OpenTime", "FinalTradeClosedTime"
+    ]
+
+    for c in keep_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    out = df[keep_cols].copy()
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out["Daily_PL"] = pd.to_numeric(out["Daily_PL"], errors="coerce")
+    out["BuyingPower"] = pd.to_numeric(out["BuyingPower"], errors="coerce")
+    for c in ["UnderlyingOpenQuote", "UnderlyingCloseQuote", "VIXOpenQuote", "VIXCloseQuote"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
 
     return out.dropna(subset=["Date", "Daily_PL"])
 
-def vix_regime_multiplier(vix):
-    if pd.isna(vix):
-        return 1.0
-    if vix < 15:
-        return 1.10
-    if vix < 20:
-        return 1.00
-    if vix < 25:
-        return 0.80
-    return 0.60
+def aggregate_daily(trades):
+    daily = trades.groupby(["Date", "Strategy"]).agg(
+        Daily_PL=("Daily_PL", "sum"),
+        BuyingPower=("BuyingPower", "sum"),
+        UnderlyingOpenQuote=("UnderlyingOpenQuote", "first"),
+        UnderlyingCloseQuote=("UnderlyingCloseQuote", "last"),
+        VIXOpenQuote=("VIXOpenQuote", "first"),
+        VIXCloseQuote=("VIXCloseQuote", "last"),
+        TradeCount=("Daily_PL", "count")
+    ).reset_index()
 
-def realized_vol_multiplier(rv):
-    if pd.isna(rv):
-        return 1.0
-    if rv < 12:
-        return 1.10
-    if rv < 18:
-        return 1.00
-    if rv < 25:
-        return 0.75
-    return 0.55
+    daily["Regime"] = daily.apply(classify_regime, axis=1)
+    daily["Return"] = daily["Daily_PL"] / daily["BuyingPower"].replace(0, np.nan)
+    daily = daily.replace([np.inf, -np.inf], np.nan)
+    return daily
 
-def build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, current_vix=None, current_spx_rv=None):
+def build_regime_performance(daily):
+    perf = daily.groupby(["Strategy", "Regime"]).agg(
+        Days=("Date", "count"),
+        Avg_Return=("Return", "mean"),
+        Median_Return=("Return", "median"),
+        Avg_PL=("Daily_PL", "mean"),
+        Win_Rate=("Daily_PL", lambda x: (x > 0).mean()),
+        Vol=("Return", "std"),
+        Worst_Day=("Daily_PL", "min"),
+        Total_PL=("Daily_PL", "sum")
+    ).reset_index()
+    return perf
+
+def build_signals(daily, expected_regime, max_capital, target_vol, min_mult, max_mult):
     rows = []
     charts = {}
-    n_strats = strategy_df["Strategy"].nunique()
 
-    for strategy, g in strategy_df.groupby("Strategy"):
+    perf = build_regime_performance(daily)
+
+    for strategy, g in daily.groupby("Strategy"):
         g = g.sort_values("Date").copy()
-
-        if g["Capital_Used"].notna().sum() == 0:
-            g["Capital_Used"] = max_capital / max(n_strats, 1)
-        else:
-            g["Capital_Used"] = g["Capital_Used"].ffill().bfill()
-
-        g["Return"] = g["Daily_PL"] / g["Capital_Used"]
+        g["BuyingPower"] = g["BuyingPower"].ffill().bfill()
+        g["Return"] = g["Daily_PL"] / g["BuyingPower"].replace(0, np.nan)
         g = g.replace([np.inf, -np.inf], np.nan).dropna(subset=["Return"])
 
         if len(g) < 30:
-            rows.append({
-                "Strategy": strategy,
-                "Signal": "Insufficient data",
-                "Recommended Capital": 0,
-                "Deployment %": 0,
-                "Reason": "Need at least 30 observations.",
-            })
+            rows.append({"Strategy": strategy, "Signal": "Insufficient data", "Recommended Capital": 0, "Deployment %": 0})
             continue
 
         model = fit_garch_11(g["Return"])
         if model is None:
-            rows.append({
-                "Strategy": strategy,
-                "Signal": "Insufficient data",
-                "Recommended Capital": 0,
-                "Deployment %": 0,
-                "Reason": "Could not estimate GARCH model.",
-            })
+            rows.append({"Strategy": strategy, "Signal": "Insufficient data", "Recommended Capital": 0, "Deployment %": 0})
             continue
 
         g["Drawdown"] = drawdown_from_pl(g["Daily_PL"])
@@ -187,7 +225,19 @@ def build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, curr
         kurt = float(g["Return"].kurt())
         p5 = float(g["Return"].quantile(0.05))
         win_rate = float((g["Daily_PL"] > 0).mean())
-        avg_daily_return = float(g["Return"].mean())
+        avg_return_all = float(g["Return"].mean())
+
+        regime_row = perf[(perf["Strategy"] == strategy) & (perf["Regime"] == expected_regime)]
+        if len(regime_row) > 0 and regime_row["Days"].iloc[0] >= 3:
+            expected_return = float(regime_row["Avg_Return"].iloc[0])
+            regime_days = int(regime_row["Days"].iloc[0])
+            regime_win = float(regime_row["Win_Rate"].iloc[0])
+            regime_source = "Regime-specific"
+        else:
+            expected_return = avg_return_all
+            regime_days = 0
+            regime_win = win_rate
+            regime_source = "Fallback: all history"
 
         vol_mult = float(np.clip(target_vol / max(model["current_ann_vol_pct"], 1e-6), min_mult, max_mult))
 
@@ -206,14 +256,14 @@ def build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, curr
         downside_penalty = 1 + abs(min(p5, 0)) * 10
         tail_mult = 1 / (tail_penalty * downside_penalty)
 
-        regime_mult = vix_regime_multiplier(current_vix) * realized_vol_multiplier(current_spx_rv)
+        edge_score = max(expected_return, 0.00001) * max(regime_win, 0.01)
+        raw_score = edge_score * vol_mult * dd_mult * tail_mult
 
-        edge_score = max(avg_daily_return, 0.00001) * max(win_rate, 0.01)
-        raw_score = edge_score * vol_mult * dd_mult * tail_mult * regime_mult
-
-        if model["current_ann_vol_pct"] > target_vol * 1.5 or current_dd < -0.15:
+        if expected_return <= 0:
+            signal = "Avoid"
+        elif model["current_ann_vol_pct"] > target_vol * 1.5 or current_dd < -0.15:
             signal = "Reduce"
-        elif model["current_ann_vol_pct"] < target_vol and current_dd > -0.05:
+        elif expected_return > avg_return_all and model["current_ann_vol_pct"] <= target_vol * 1.25:
             signal = "Deploy"
         else:
             signal = "Hold"
@@ -221,23 +271,22 @@ def build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, curr
         rows.append({
             "Strategy": strategy,
             "Signal": signal,
-            "Avg Daily Return %": avg_daily_return * 100,
-            "Win Rate %": win_rate * 100,
+            "Expected Regime": expected_regime,
+            "Regime Source": regime_source,
+            "Regime Days": regime_days,
+            "Expected Regime Return %": expected_return * 100,
+            "All-History Avg Return %": avg_return_all * 100,
+            "Regime Win Rate %": regime_win * 100,
             "GARCH Vol %": model["current_ann_vol_pct"],
             "Long-Run Vol %": model["long_run_ann_vol_pct"],
-            "Alpha": model["alpha"],
-            "Beta": model["beta"],
             "Alpha + Beta": model["alpha_beta"],
-            "Vol Half-Life Days": model["half_life_days"],
             "Current Drawdown %": current_dd * 100,
             "Excess Kurtosis": kurt,
             "5th Percentile Return %": p5 * 100,
             "Vol Multiplier": vol_mult,
             "Drawdown Multiplier": dd_mult,
             "Tail Multiplier": tail_mult,
-            "Regime Multiplier": regime_mult,
             "Raw Score": raw_score,
-            "Reason": "Volatility, drawdown, tail-risk, and regime-adjusted allocation score.",
         })
 
         charts[strategy] = {
@@ -257,26 +306,31 @@ def build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, curr
         signals["Recommended Capital"] = 0
         signals["Deployment %"] = 0
 
-    return signals.sort_values("Recommended Capital", ascending=False), charts
+    return signals.sort_values("Recommended Capital", ascending=False), charts, perf
 
+# -----------------------------
+# Sidebar controls
+# -----------------------------
 st.sidebar.header("Portfolio Controls")
 max_capital = st.sidebar.number_input("Maximum Trading Capital", min_value=1000, value=100000, step=5000)
 target_vol = st.sidebar.number_input("Target Annualized Strategy Volatility (%)", min_value=1.0, value=18.0, step=1.0)
 min_mult = st.sidebar.slider("Minimum Strategy Multiplier", 0.0, 1.0, 0.40, 0.05)
 max_mult = st.sidebar.slider("Maximum Strategy Multiplier", 0.5, 2.0, 1.25, 0.05)
 
-st.sidebar.header("Market Regime Inputs")
-current_vix = st.sidebar.number_input("Current VIX", min_value=0.0, value=18.0, step=0.5)
-current_spx_rv = st.sidebar.number_input("SPX 20-Day Realized Vol (%)", min_value=0.0, value=12.0, step=0.5)
-st.sidebar.write("Designed daily run time: **7:00 AM Mountain Time**")
+st.sidebar.header("Expected Regime")
+expected_regime = st.sidebar.selectbox(
+    "Select expected market regime for today's deployment",
+    ["Normal", "Compression", "Trend Up", "Trend Down", "Vol Expansion"]
+)
 
-st.header("1. Upload Strategy Daily Data")
+st.sidebar.caption("Version 3: Regime-aware allocation engine")
+
+# -----------------------------
+# Uploads
+# -----------------------------
+st.header("1. Upload Daily Strategy Export Files")
 st.markdown("""
-Upload one file per strategy.
-
-Required columns: `Date`, `Daily_PL` or `P/L`
-
-Recommended columns: `Capital_Used` or `Margin`
+Upload the actual strategy export files. The app will aggregate them by date and classify each day by regime using SPX and VIX open/close behavior.
 """)
 
 c1, c2 = st.columns(2)
@@ -302,28 +356,50 @@ frames = []
 for name, f in uploads:
     if f is not None:
         try:
-            frames.append(parse_strategy_file(f, name))
+            frames.append(parse_trade_file(f, name))
         except Exception as e:
             st.error(str(e))
 
 if not frames:
-    st.info("Upload strategy-level daily files to generate signals.")
+    st.info("Upload strategy export files to generate regime-aware signals.")
     st.stop()
 
-strategy_df = pd.concat(frames, ignore_index=True)
+trades = pd.concat(frames, ignore_index=True)
+daily = aggregate_daily(trades)
 
-st.subheader("Uploaded Data Preview")
-st.dataframe(strategy_df.tail(25), use_container_width=True)
+st.subheader("Daily Aggregated Data Preview")
+st.dataframe(daily.tail(25), use_container_width=True)
 
-st.header("2. Today’s Capital Deployment Signal")
-signals, charts = build_signals(strategy_df, max_capital, target_vol, min_mult, max_mult, current_vix, current_spx_rv)
+# -----------------------------
+# Regime matrix
+# -----------------------------
+st.header("2. Regime Performance Matrix")
+perf = build_regime_performance(daily)
+
+pivot = perf.pivot_table(
+    index="Strategy",
+    columns="Regime",
+    values="Avg_Return",
+    aggfunc="mean"
+) * 100
+
+st.caption("Average daily return by strategy and regime.")
+st.dataframe(pivot.round(3), use_container_width=True)
+
+# -----------------------------
+# Signals
+# -----------------------------
+st.header("3. Today’s Regime-Aware Deployment Signal")
+signals, charts, perf = build_signals(daily, expected_regime, max_capital, target_vol, min_mult, max_mult)
 
 st.caption(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 display_cols = [
     "Strategy", "Signal", "Recommended Capital", "Deployment %",
-    "GARCH Vol %", "Current Drawdown %", "Excess Kurtosis",
-    "Win Rate %", "Avg Daily Return %", "Alpha + Beta"
+    "Expected Regime", "Expected Regime Return %",
+    "Regime Days", "Regime Win Rate %",
+    "GARCH Vol %", "Current Drawdown %",
+    "Excess Kurtosis", "Alpha + Beta"
 ]
 display_cols = [c for c in display_cols if c in signals.columns]
 
@@ -337,11 +413,14 @@ m1.metric("Recommended Deployment", f"${total_deployed:,.0f}")
 m2.metric("Cash Reserve", f"${cash_reserve:,.0f}")
 m3.metric("Max Capital", f"${max_capital:,.0f}")
 
-st.header("3. Charts")
+# -----------------------------
+# Charts
+# -----------------------------
+st.header("4. Charts")
 
 fig, ax = plt.subplots(figsize=(10, 5))
 ax.bar(signals["Strategy"], signals["Recommended Capital"])
-ax.set_title("Recommended Capital by Strategy")
+ax.set_title(f"Recommended Capital by Strategy — Expected Regime: {expected_regime}")
 ax.set_ylabel("Capital ($)")
 st.pyplot(fig)
 
@@ -363,13 +442,22 @@ ax3.set_ylabel("Annualized Volatility (%)")
 ax3.legend()
 st.pyplot(fig3)
 
-st.header("4. Export Signal")
-csv = signals.to_csv(index=False).encode("utf-8")
+# -----------------------------
+# Downloads
+# -----------------------------
+st.header("5. Export")
 st.download_button(
     "Download Today’s Signal CSV",
-    csv,
-    file_name=f"garch_signal_{datetime.now().date()}.csv",
-    mime="text/csv",
+    signals.to_csv(index=False).encode("utf-8"),
+    file_name=f"regime_garch_signal_{datetime.now().date()}.csv",
+    mime="text/csv"
 )
 
-st.warning("Research and decision-support only. This app does not place trades and should be validated before scaling capital.")
+st.download_button(
+    "Download Regime Performance CSV",
+    perf.to_csv(index=False).encode("utf-8"),
+    file_name="strategy_regime_performance.csv",
+    mime="text/csv"
+)
+
+st.warning("Research and decision-support only. This app does not place trades.")
